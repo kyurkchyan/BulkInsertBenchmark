@@ -4,12 +4,20 @@ A .NET 8 benchmark comparing the performance of different bulk insert strategies
 
 ## What it benchmarks
 
-Two approaches are compared:
+### Insert
 
 | Benchmark | Description |
 |---|---|
 | `SqlBulkCopy` *(baseline)* | ADO.NET `SqlBulkCopy` with a `DataTable`, batched at 10,000 rows, wrapped in a transaction |
 | `EFCore.BulkExtensions` | [`EFCore.BulkExtensions`](https://github.com/borisdj/EFCore.BulkExtensions) `BulkInsert`, batched at 10,000 rows |
+
+### Update & Delete
+
+| Benchmark | Description |
+|---|---|
+| `Loop + SaveChanges` *(baseline)* | Load all entities into memory with change tracking, mutate each one, call `SaveChanges` |
+| `ExecuteUpdateAsync` | EF Core 7+ set-based update — single SQL `UPDATE`, no entity loading |
+| `ExecuteDeleteAsync` | EF Core 7+ set-based delete — single SQL `DELETE`, no entity loading |
 
 The test entity is an `Order` with 6 fields (string, DateTime, decimal, int).
 
@@ -21,13 +29,22 @@ The test entity is an `Order` with 6 fields (string, DateTime, decimal, int).
 ## Running
 
 ```bash
-# Quick timed comparison — 1,000,000 records (default)
+# Insert comparison — 1,000,000 records (default)
 dotnet run -c Release
 
-# Custom record count
+# Insert comparison — custom record count
 dotnet run -c Release -- 5000000
 
-# Full BenchmarkDotNet run — 10K / 100K / 500K, 3 iterations each
+# Update comparison — 100,000 records (default)
+dotnet run -c Release -- update
+
+# Update comparison — custom record count
+dotnet run -c Release -- update 500000
+
+# Delete comparison — 100,000 records (default)
+dotnet run -c Release -- delete
+
+# Full BenchmarkDotNet run (Insert + Update + Delete, 10K/50K/100K, 3 iterations)
 dotnet run -c Release -- --benchmark
 ```
 
@@ -52,6 +69,22 @@ Measured on a WSL2/Docker environment (93 GB RAM, SQL Server 2022).
 | `EFCore.BulkExtensions` | 65.38s | 152,962 rec/sec |
 
 **Takeaway:** `EFCore.BulkExtensions` has a slight edge at lower record counts (avoids materialising a `DataTable`), while raw `SqlBulkCopy` pulls ahead at 10M+ rows where its lower per-batch overhead amortises the `DataTable` cost.
+
+### UPDATE — 100,000 records
+
+| Method | Time | Throughput | Ratio |
+|---|---|---|---|
+| `Loop + SaveChanges` | 85.44s | 1,170 rec/sec | 191× slower |
+| `ExecuteUpdateAsync` | **0.45s** | **223,832 rec/sec** | — |
+
+### DELETE — 100,000 records
+
+| Method | Time | Throughput | Ratio |
+|---|---|---|---|
+| `Loop + SaveChanges` | 5.05s | 19,800 rec/sec | 25× slower |
+| `ExecuteDeleteAsync` | **0.20s** | **511,666 rec/sec** | — |
+
+**Takeaway:** `ExecuteUpdateAsync` is **191× faster** than the loop approach for updates — loading 100K entities into the change tracker and issuing per-row `UPDATE` statements dominates the cost. `ExecuteDeleteAsync` is **25× faster**; the loop is less extreme because EF Core batches deletes more aggressively than updates.
 
 ## Dependencies
 
