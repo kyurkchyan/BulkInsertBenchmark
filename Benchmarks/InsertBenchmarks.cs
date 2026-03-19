@@ -1,11 +1,11 @@
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Jobs;
+using BenchmarkDotNet.Toolchains.InProcess.Emit;
 using BulkInsertBenchmark.Data;
 using BulkInsertBenchmark.Helpers;
 using BulkInsertBenchmark.Models;
 using EFCore.BulkExtensions;
-using Microsoft.Extensions.Configuration;
 
 namespace BulkInsertBenchmark.Benchmarks;
 
@@ -22,12 +22,9 @@ public class InsertBenchmarks
     [GlobalSetup]
     public void GlobalSetup()
     {
-        var config = new ConfigurationBuilder()
-            .SetBasePath(AppContext.BaseDirectory)
-            .AddJsonFile("appsettings.json", optional: false)
-            .Build();
-
-        _connectionString = config["ConnectionString"]!;
+        // Container was started by Program.cs before BenchmarkRunner.Run was called.
+        // InProcessEmitToolchain keeps us in the same process so the static field is shared.
+        _connectionString = ContainerFixture.ConnectionString;
 
         using var ctx = new AppDbContext(_connectionString);
         ctx.Database.EnsureCreated();
@@ -50,13 +47,12 @@ public class InsertBenchmarks
     public void EfCoreBulkExtensions()
     {
         using var ctx = new AppDbContext(_connectionString);
-        var bulkConfig = new BulkConfig
+        ctx.BulkInsert(_orders, new BulkConfig
         {
             BatchSize = 10_000,
             SetOutputIdentity = false,
             PreserveInsertOrder = false
-        };
-        ctx.BulkInsert(_orders, bulkConfig);
+        });
     }
 
     [GlobalCleanup]
@@ -66,11 +62,16 @@ public class InsertBenchmarks
     }
 }
 
+/// <summary>
+/// Uses InProcessEmitToolchain so benchmarks run in the same process as Program.cs,
+/// allowing them to share the already-running Testcontainers SQL Server instance.
+/// </summary>
 public class BenchmarkConfig : ManualConfig
 {
     public BenchmarkConfig()
     {
         AddJob(Job.Default
+            .WithToolchain(InProcessEmitToolchain.Instance)
             .WithWarmupCount(1)
             .WithIterationCount(3)
             .WithInvocationCount(1)
