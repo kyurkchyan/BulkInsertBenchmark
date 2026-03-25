@@ -20,8 +20,22 @@ namespace BulkInsertBenchmark.Benchmarks;
 //   vw_ServiceQueue_Union    — uses UNION    (deduplicates across all branches)
 //   vw_ServiceQueue_UnionAll — uses UNION ALL (no deduplication, semantically identical)
 //
-// Queries filter by ServiceCenterId + open status, mirroring the real-world
-// pattern that triggered production timeouts.
+// WHY WITHINDEX IS THE CRITICAL PARAMETER
+// ────────────────────────────────────────
+// Without an index, both views perform full table scans. The extra deduplication
+// sort from UNION adds some overhead but both are roughly equal — the scan
+// dominates. This is the misleading case: it makes UNION look "fine".
+//
+// The real problem surfaces when you add a composite index on
+// (ServiceCenterId, ResolutionStatus, IsAvailable). With UNION ALL, SQL Server
+// can push the WHERE predicate into each branch and use an index seek — touching
+// only the matching rows. With UNION, SQL Server must materialise all rows from
+// all branches and sort/hash them to deduplicate before it can count or page —
+// the index seek happens per branch, but the deduplication blows away any saving.
+//
+// For COUNT in particular, UNION ALL allows SQL Server to sum branch counts
+// without materialising rows at all. UNION cannot — it must compare every row.
+// This is what caused 5 GB memory grants and 20 s timeouts in production.
 
 [Config(typeof(BenchmarkConfig))]
 [MemoryDiagnoser]
@@ -34,16 +48,23 @@ public class UnionVsUnionAllBenchmarks
     [Params(50_000, 300_000)]
     public int RecordCount { get; set; }
 
+    /// <summary>
+    /// Without index: both views do full scans — UNION overhead is minor.
+    /// With index: UNION ALL gets a fast index seek per branch; UNION still
+    /// materialises everything for deduplication — the gap becomes dramatic.
+    /// </summary>
+    [Params(false, true)]
+    public bool WithIndex { get; set; }
+
     [GlobalSetup]
     public void GlobalSetup()
     {
         _connectionString = ContainerFixture.ConnectionString;
         _serviceCenterId  = ServiceQueueSchema.Setup(_connectionString);
         ServiceQueueSchema.Seed(_connectionString, RecordCount, _serviceCenterId);
+        if (WithIndex) ServiceQueueSchema.CreateIndex(_connectionString);
     }
 
-    // Baseline: UNION forces a full deduplication sort/hash across all branches
-    // before the WHERE ServiceCenterId = @id predicate is applied.
     [Benchmark(Baseline = true, Description = "COUNT — UNION view")]
     public int Count_Union() =>
         ServiceQueueSchema.Count(_connectionString, "vw_ServiceQueue_Union", _serviceCenterId);
@@ -386,6 +407,33 @@ public static class ServiceQueueSchema
                 reader.GetInt32(8)));
         }
         return rows;
+    }
+
+    /// <summary>
+    /// Creates a composite index on ServiceForms that directly supports the
+    /// benchmark query: WHERE ServiceCenterId = @id AND ResolutionStatus = 0
+    /// AND IsAvailable = 1 ORDER BY DateCreated DESC.
+    ///
+    /// With UNION ALL this index enables an index seek per branch — SQL Server
+    /// can push predicates into each branch individually and avoid touching
+    /// unrelated rows entirely.
+    ///
+    /// With UNION this index still helps each branch seek, but deduplication
+    /// requires SQL Server to materialise and hash/sort the full combined result
+    /// before returning anything — so COUNT cannot short-circuit and a paged
+    /// query must process far more rows than it returns.
+    /// </summary>
+    public static void CreateIndex(string cs)
+    {
+        using var conn = new SqlConnection(cs);
+        conn.Open();
+        Exec(conn, """
+            CREATE INDEX IX_ServiceForms_QueueFilter
+            ON dbo.ServiceForms (ServiceCenterId, ResolutionStatus, IsAvailable)
+            INCLUDE (DateCreated, DeviceSerial, DeviceType, IssueDescription,
+                     AssignedTechnician, DateResolved,
+                     OnServiceRequest, OnCustomerReturn, OnDirectExchange, OnStoreReturn);
+            """);
     }
 
     public static void Teardown(string cs)

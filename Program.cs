@@ -93,19 +93,9 @@ static async Task RunUnionVsUnionAllComparison(string cs, int count)
 {
     Console.WriteLine($"UNION vs UNION ALL — {count:N0} ServiceForms rows");
     Console.WriteLine("Schema: ServiceForms → 4 mutually-exclusive branches via nullable FKs");
-    Console.WriteLine("Query:  WHERE ServiceCenterId = @id AND ResolutionStatus = 0 AND IsAvailable = 1");
-    PrintSeparator();
-
-    Console.Write($"Creating schema and seeding {count:N0} rows... ");
-    var sw = Stopwatch.StartNew();
-    var primaryId = ServiceQueueSchema.Setup(cs);
-    ServiceQueueSchema.Seed(cs, count, primaryId);
-    sw.Stop();
-    Console.WriteLine($"done ({sw.Elapsed.TotalSeconds:F1}s)\n");
+    Console.WriteLine("Query:  WHERE ServiceCenterId = @id AND ResolutionStatus = 0 AND IsAvailable = 1\n");
 
     const int runs = 5;
-
-    Console.WriteLine($"Running each query {runs}x — reporting median ms\n");
 
     long MedianMs(Func<long> measure)
     {
@@ -113,26 +103,36 @@ static async Task RunUnionVsUnionAllComparison(string cs, int count)
         return samples[runs / 2];
     }
 
-    // COUNT queries
-    var unionCountMs    = MedianMs(() => { var t = Stopwatch.GetTimestamp(); ServiceQueueSchema.Count(cs, "vw_ServiceQueue_Union",    primaryId); return ElapsedMs(t); });
-    var unionAllCountMs = MedianMs(() => { var t = Stopwatch.GetTimestamp(); ServiceQueueSchema.Count(cs, "vw_ServiceQueue_UnionAll", primaryId); return ElapsedMs(t); });
+    void RunPhase(string label, bool withIndex)
+    {
+        Console.Write($"  Seeding {count:N0} rows... ");
+        var sw = Stopwatch.StartNew();
+        var primaryId = ServiceQueueSchema.Setup(cs);
+        ServiceQueueSchema.Seed(cs, count, primaryId);
+        if (withIndex) ServiceQueueSchema.CreateIndex(cs);
+        sw.Stop();
+        Console.WriteLine($"done ({sw.Elapsed.TotalSeconds:F1}s)");
 
-    // Paged queries
-    var unionPageMs    = MedianMs(() => { var t = Stopwatch.GetTimestamp(); ServiceQueueSchema.PagedQuery(cs, "vw_ServiceQueue_Union",    primaryId); return ElapsedMs(t); });
-    var unionAllPageMs = MedianMs(() => { var t = Stopwatch.GetTimestamp(); ServiceQueueSchema.PagedQuery(cs, "vw_ServiceQueue_UnionAll", primaryId); return ElapsedMs(t); });
+        var unionCountMs    = MedianMs(() => { var t = Stopwatch.GetTimestamp(); ServiceQueueSchema.Count(cs, "vw_ServiceQueue_Union",    primaryId); return ElapsedMs(t); });
+        var unionAllCountMs = MedianMs(() => { var t = Stopwatch.GetTimestamp(); ServiceQueueSchema.Count(cs, "vw_ServiceQueue_UnionAll", primaryId); return ElapsedMs(t); });
+        var unionPageMs     = MedianMs(() => { var t = Stopwatch.GetTimestamp(); ServiceQueueSchema.PagedQuery(cs, "vw_ServiceQueue_Union",    primaryId); return ElapsedMs(t); });
+        var unionAllPageMs  = MedianMs(() => { var t = Stopwatch.GetTimestamp(); ServiceQueueSchema.PagedQuery(cs, "vw_ServiceQueue_UnionAll", primaryId); return ElapsedMs(t); });
 
-    Console.WriteLine($"  {"Query",-35} {"UNION",10} {"UNION ALL",10} {"Speedup",10}");
-    Console.WriteLine($"  {new string('─', 67)}");
-    PrintUnionRow("COUNT(*)",               unionCountMs,    unionAllCountMs);
-    PrintUnionRow("Page 1 (TOP 50, ORDER)", unionPageMs,     unionAllPageMs);
+        Console.WriteLine($"\n  {label}");
+        Console.WriteLine($"  {new string('─', 67)}");
+        Console.WriteLine($"  {"Query",-35} {"UNION",8} {"UNION ALL",10} {"Speedup",9}");
+        Console.WriteLine($"  {new string('─', 67)}");
+        PrintUnionRow("COUNT(*)",               unionCountMs,   unionAllCountMs);
+        PrintUnionRow("Page 1 (TOP 50, ORDER)", unionPageMs,    unionAllPageMs);
+        Console.WriteLine();
 
-    Console.WriteLine();
-    Console.WriteLine("Row counts returned:");
-    Console.WriteLine($"  UNION    COUNT: {ServiceQueueSchema.Count(cs, "vw_ServiceQueue_Union",    primaryId):N0}");
-    Console.WriteLine($"  UNION ALL COUNT: {ServiceQueueSchema.Count(cs, "vw_ServiceQueue_UnionAll", primaryId):N0}");
-    Console.WriteLine("\n(Identical counts confirm UNION deduplication was wasted work.)");
+        ServiceQueueSchema.Teardown(cs);
+    }
 
-    ServiceQueueSchema.Teardown(cs);
+    RunPhase("Phase 1 — No index (both views scan the full table)", withIndex: false);
+    RunPhase("Phase 2 — With composite index on (ServiceCenterId, ResolutionStatus, IsAvailable)", withIndex: true);
+
+    Console.WriteLine("Identical row counts from both views confirm UNION deduplication is wasted work.");
     await Task.CompletedTask;
 }
 
