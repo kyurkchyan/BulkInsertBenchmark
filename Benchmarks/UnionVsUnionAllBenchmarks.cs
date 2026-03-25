@@ -1,4 +1,7 @@
 using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Configs;
+using BenchmarkDotNet.Jobs;
+using BenchmarkDotNet.Toolchains.InProcess.Emit;
 using BulkInsertBenchmark.Helpers;
 using Microsoft.Data.SqlClient;
 using System.Data;
@@ -36,8 +39,25 @@ namespace BulkInsertBenchmark.Benchmarks;
 // For COUNT in particular, UNION ALL allows SQL Server to sum branch counts
 // without materialising rows at all. UNION cannot — it must compare every row.
 // This is what caused 5 GB memory grants and 20 s timeouts in production.
+//
+// WHAT THIS BENCHMARK CANNOT REPRODUCE
+// ─────────────────────────────────────
+// The 5 GB memory grants observed in production are not captured here.
+// BenchmarkDotNet's Allocated column measures .NET heap only — SQL Server's
+// internal memory grants are invisible to it. A Docker container also caps
+// SQL Server's available memory, preventing the grant over-allocation that
+// caused system-wide pressure in production.
+//
+// At 300k rows the UNION hash-dedup adds ~10-20ms in isolation — modest in a
+// clean benchmark. In production, the same dedup under concurrent load (200+
+// executions/min), combined with LCK_M_S lock waits and missing indexes, was
+// the amplifier that pushed individual queries to 20 s.
+//
+// This benchmark reliably demonstrates the INDEX story (no-index → with-index
+// speedup). The UNION vs UNION ALL story is best supported by the production
+// Redgate metrics: 794k logical reads, 5 GB memory grants, 72 s total lock wait.
 
-[Config(typeof(BenchmarkConfig))]
+[Config(typeof(UnionBenchmarkConfig))]
 [MemoryDiagnoser]
 public class UnionVsUnionAllBenchmarks
 {
@@ -83,6 +103,24 @@ public class UnionVsUnionAllBenchmarks
 
     [GlobalCleanup]
     public void GlobalCleanup() => ServiceQueueSchema.Teardown(_connectionString);
+}
+
+// ─── Benchmark config ─────────────────────────────────────────────────────────
+
+// Separate config from InsertBenchmarks: SQL queries run 50-200ms each so we
+// need more iterations for stable statistics. Warmup=2 lets SQL Server compile
+// and cache the execution plan before we start measuring.
+public class UnionBenchmarkConfig : ManualConfig
+{
+    public UnionBenchmarkConfig()
+    {
+        AddJob(Job.Default
+            .WithToolchain(InProcessEmitToolchain.Instance)
+            .WithWarmupCount(2)
+            .WithIterationCount(7)
+            .WithInvocationCount(1)
+            .WithUnrollFactor(1));
+    }
 }
 
 // ─── Domain model ─────────────────────────────────────────────────────────────
